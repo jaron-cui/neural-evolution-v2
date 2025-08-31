@@ -1,9 +1,21 @@
-from typing import List, Callable
+from dataclasses import dataclass
+from typing import List, Callable, Dict, Tuple
 
 import torch
 import torch.nn as nn
 
 from neuron import NeuronDataFields, NeuronDataField
+
+
+@dataclass
+class Genome:
+  initial_latent_states: Dict[str, torch.Tensor]  # each will have a neuron instantiated in its own chamber
+  step_network: 'StepNetwork'
+  connection_phenotype_network: 'ConnectionPhenotypeNetwork'
+  connection_change_network: 'ConnectionChangeNetwork'
+  mitosis_network: 'MitosisNetwork'
+  max_chamber_capacity: int = 20
+  chamber_count: int = 10
 
 
 class GenomicNetwork(nn.Module):
@@ -18,6 +30,7 @@ class GenomicNetwork(nn.Module):
     hidden_layers: int = 1
   ):
     super().__init__()
+    self.d = d
     self.input_fields = input_fields
     self.output_fields = output_fields
     self.input_indices = d.indices(self.input_fields)
@@ -43,9 +56,15 @@ class GenomicNetwork(nn.Module):
       nn.Linear(hidden_size, output_size)
     )
 
-  def forward(self, neuron_data: torch.Tensor):
+  def forward(self, neuron_data: torch.Tensor, split_result: bool = False) -> Tuple[torch.Tensor, ...] | torch.Tensor:
+    d = self.d
     x = neuron_data[..., self.input_indices] if self.apply_input_mask else neuron_data
-    return self.layers(x)
+    out: torch.Tensor = self.layers(x)
+
+    if split_result:
+      return tuple(out[d.indices(f, self.output_fields)] for f in self.output_fields)
+    else:
+      return out
 
 
 class StepNetwork(GenomicNetwork):
@@ -84,7 +103,7 @@ class StepNetwork(GenomicNetwork):
 
         lambda t: torch.full((*t.shape[:-1], 1), 1.0),
         lambda t: torch.full((*t.shape[:-1], 1), 1.0),
-        lambda t: torch.full((*t.shape[:-1], 1), 0.1),
+        lambda t: torch.full((*t.shape[:-1], 1), 0.1)
       ]
     )
 
@@ -159,12 +178,16 @@ class MitosisNetwork(GenomicNetwork):
       output_fields=[
         d.latent_state,
         d.latent_state,
-        d.group_affinities
+        d.group_affinities,
+        d.connection_strength_change,
+        d.connection_strength_change
       ],
       reference_prior=[
         lambda t: t[..., d.indices(d.latent_state)],
         lambda t: t[..., d.indices(d.latent_state)],
-        lambda t: t[..., d.indices(d.group_affinities)]
+        lambda t: t[..., d.indices(d.group_affinities)],
+        lambda t: torch.full((*t.shape[:-1], 1), 1.0),
+        lambda t: torch.full((*t.shape[:-1], 1), 0.0)
       ]
     )
 

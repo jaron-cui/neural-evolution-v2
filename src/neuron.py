@@ -30,7 +30,7 @@ class NeuronDataFields:
   hormone_level = NeuronDataField(size=4)
   mitosis_progress = NeuronDataField(size=1)
   apoptosis_progress = NeuronDataField(size=1)
-  group_affinities = NeuronDataField(size=8)
+  group_affinities = NeuronDataField(size=10)
 
   # derived neuron parameters
   base_output_signal_rate = NeuronDataField(size=1)
@@ -41,14 +41,19 @@ class NeuronDataFields:
   connection_phenotype = NeuronDataField(size=4)
   connection_strength_change = NeuronDataField(size=1)
 
-  def indices(self, fields: NeuronDataField | Sequence[NeuronDataField]) -> slice | List[int]:
+  def indices(
+    self,
+    fields: NeuronDataField | Sequence[NeuronDataField],
+    data_fields: Sequence[NeuronDataField] = None
+  ) -> slice | List[int]:
     if isinstance(fields, NeuronDataField):
       fields = [fields]
     else:
       fields = sorted(fields, key=lambda f: f.id)
 
     field_id_set = set(f.id for f in fields)
-    data_fields = self.get_neuron_data_fields()
+    if data_fields is None:
+      data_fields = self.get_neuron_data_fields()
     data_field_id_set = set(df.id for df in data_fields)
 
     if any(fid not in data_field_id_set for fid in field_id_set):
@@ -94,38 +99,3 @@ class NeuronDataFields:
       self.input_signal_rate_multiplier,
       self.potassium_recovery_rate
     ]
-
-
-@dataclass
-class EnvironmentalDataConfig:
-  total_output_connection_strength: int = 1
-  total_input_connection_strength: int = 1
-  # external_hormone: int = 4
-
-
-@dataclass
-class NeuronDataConfig:
-  external_sodium_level: int = 1
-  internal_potassium_level: int = 1
-  max_internal_potassium_level: int = 1
-  latent_state: int = 8
-  hormone_level: int = 4
-  mitosis_progress: int = 1,
-  apoptosis_progress: int = 1
-
-
-@dataclass
-class DerivedParametersConfig:
-  base_output_signal_rate: int = 1
-  input_signal_rate_multiplier: int = 1
-  potassium_recovery_rate: int = 1
-
-
-class NeuronData:
-  def __init__(
-    self,
-    environmental_data_config: EnvironmentalDataConfig,
-    neuron_config: NeuronDataConfig,
-    derived_parameters_config: DerivedParametersConfig
-  ):
-    pass
