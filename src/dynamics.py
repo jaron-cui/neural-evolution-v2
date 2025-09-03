@@ -1,3 +1,5 @@
+from typing import Tuple
+
 import torch
 
 from genome import Genome
@@ -39,9 +41,51 @@ class NeuralSimulation:
 
       self.neurons[neuron_index] = neuron_data
 
+  def _allocate_neurons(self, chamber_numbers: torch.Tensor) -> torch.Tensor:
+    allocated_neuron_indices = torch.full_like(chamber_numbers, -1)
+    for chamber_number in range(self.genome.chamber_count):
+      chamber_start = chamber_number * self.genome.max_chamber_capacity
+      chamber_end = chamber_start + self.genome.max_chamber_capacity
+
+      chamber_mask = torch.zeros_like(self.living_neuron_mask, dtype=torch.bool)
+      chamber_mask[chamber_start:chamber_end] = True
+
+      chamber_requests = chamber_numbers.eq(chamber_number)
+      chamber_request_count = chamber_requests.int().sum()
+
+      free_spaces = ~self.living_neuron_mask & chamber_mask
+      cumulative_sum = torch.cumsum(free_spaces.int(), dim=-1)
+      if cumulative_sum[-1] < chamber_request_count:
+        raise ValueError('Cannot allocate neurons: chamber is full.')
+
+      free_spaces[cumulative_sum > chamber_request_count] = False
+      allocated_indices = torch.nonzero(free_spaces, as_tuple=False).squeeze()
+
+      self.living_neuron_mask[allocated_indices] = False
+      allocated_neuron_indices[chamber_requests] = allocated_indices
+    self.neurons[allocated_neuron_indices].zero_()
+    return allocated_neuron_indices
+
+  def modulate_chamber_selection(self, chamber_affinity: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    chamber_affinity = chamber_affinity.clone()
+    chamber_living_mask = self.living_neuron_mask.view((self.genome.chamber_count, self.genome.max_chamber_capacity))
+    chamber_selection = torch.full((chamber_affinity.size(0),), -1, dtype=torch.int)
+    while chamber_selection.eq(-1).sum() > 0:
+      naive_chamber_selection = torch.argmax(chamber_affinity, dim=-1)
+      reproductive_round = first_n_unique_indices(naive_chamber_selection)
+
+      population_counts = chamber_living_mask.sum(dim=-1)
+      population_ratios = population_counts / self.genome.max_chamber_capacity
+
+      chamber_affinity[reproductive_round] -= population_ratios
+      chamber_selection[reproductive_round] = naive_chamber_selection[reproductive_round]
+    return chamber_affinity, chamber_selection
+
   def step(self, genome: Genome):
     d = self.d
     new_neurons = torch.zeros_like(self.neurons)
+
+    # TODO: hormones for population
 
     # calculate systemic statistics TODO: perhaps move this after connection and other updates
     inter_chamber_connection_mask = self.inter_chamber_connections[:, :, :, 0] >= 0
@@ -122,8 +166,72 @@ class NeuralSimulation:
       internal_to_external_mask[internal_to_external_mask] = src_in_chamber
       self.inter_chamber_connection_strength[internal_to_external_mask] += internal_to_external_changes
 
-    # process signals per group
+    # -- process signals per group --
+    raw_output_signal_rate = self.neurons[:, d.indices(d.output_signal_rate)]
+    raw_output_signal_rate[~self.living_neuron_mask] = 0
+    # internal input signal rate
+    input_signal_rate = self.chamber_connection_strength * torch.stack(
+      raw_output_signal_rate.chunk(self.genome.chamber_count)
+    ).unsqueeze(2).sum(dim=1).flatten()
+
+    # add inter-chamber signals
+    inter_chamber_signal_rate = inter_chamber_connection_strength * raw_output_signal_rate[inter_chamber_connection_src]
+    input_signal_rate.scatter_add_(0, inter_chamber_connection_dst, inter_chamber_signal_rate)
+
+    potassium = self.neurons[:, d.indices(d.internal_potassium_level)]
+    potassium_recovery = self.neurons[:, d.indices(d.potassium_recovery_rate)]
+    output_signal_rate = torch.minimum((
+      input_signal_rate * self.neurons[:, d.indices(d.input_signal_rate_multiplier)]
+      + self.neurons[:, d.indices(d.base_output_signal_rate)]
+    ), potassium)  # TODO: sodium?
+    new_neurons[:, d.indices(d.output_signal_rate)] = output_signal_rate
+    new_neurons[:, d.indices(d.internal_potassium_level)] = potassium - output_signal_rate + potassium_recovery
 
 
     # handle apoptosis and mitosis
-    pass
+    apoptosis_initiated = self.neurons[:, d.indices(d.apoptosis_progress)] >= 1
+    new_neurons[apoptosis_initiated].zero_()
+    self.living_neuron_mask[apoptosis_initiated] = False
+
+    mitosis_initiated = (self.neurons[:, d.indices(d.mitosis_progress)] >= 1) & ~apoptosis_initiated
+    parent_data = self.neurons[mitosis_initiated]
+    parent_indices = torch.nonzero(mitosis_initiated, as_tuple=False).squeeze()
+    (
+      parent_latent,
+      child_latent,
+      group_affinities,
+      parent_child_connection_strength,
+      child_parent_connection_strength
+    ) = self.genome.mitosis_network.forward(parent_data)
+    chamber_affinity, chamber_selection = self.modulate_chamber_selection(group_affinities)
+    new_neurons[mitosis_initiated, d.indices(d.latent_state)] = parent_latent
+    child_indices = self._allocate_neurons(chamber_selection)
+    new_neurons[child_indices, d.indices(d.latent_state)] = child_latent
+    new_neurons[child_indices, d.indices(d.group_affinities)] = chamber_affinity
+
+    parent_chamber_number = parent_indices // self.genome.max_chamber_capacity
+    parent_chamber_index = parent_indices % self.genome.max_chamber_capacity
+    child_chamber_index = child_indices % self.genome.max_chamber_capacity
+    internal_mitosis = chamber_selection.eq(parent_chamber_number)
+    self.chamber_connection_strength[
+      parent_chamber_number[internal_mitosis],
+      parent_chamber_index[internal_mitosis],
+      child_chamber_index[internal_mitosis]
+    ] = parent_child_connection_strength
+    self.chamber_connection_strength[
+      parent_chamber_number[internal_mitosis],
+      child_chamber_index[internal_mitosis],
+      parent_chamber_index[internal_mitosis]
+    ] = child_parent_connection_strength
+
+    self.inter_chamber_connections[
+      parent_chamber_number[~internal_mitosis],
+      chamber_selection[~internal_mitosis],
+
+    ]
+
+def unique_prefix_length(tensor):
+  return (torch.cumsum(torch.zeros_like(tensor).scatter_(0, tensor, 1), dim=0).eq(1)).sum()
+
+def first_n_unique_indices(tensor):
+  return torch.unique(tensor, return_inverse=True)[1].sort()[1]
