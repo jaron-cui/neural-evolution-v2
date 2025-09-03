@@ -22,6 +22,8 @@ class NeuronDataFields:
   total_output_connection_strength = NeuronDataField(size=1)
   total_input_connection_strength = NeuronDataField(size=1)
   output_signal_rate = NeuronDataField(size=1)
+  input_connection_character = NeuronDataField(size=4)
+  output_connection_character = NeuronDataField(size=4)
 
   # neuron state
   external_sodium_level = NeuronDataField(size=1)  # TODO: possibly implement sodium mechanic as a signal buffer
@@ -89,6 +91,8 @@ class NeuronDataFields:
       self.total_output_connection_strength,
       self.total_input_connection_strength,
       self.output_signal_rate,
+      self.input_connection_character,
+      self.output_connection_character,
       self.external_sodium_level,
       self.internal_potassium_level,
       self.max_internal_potassium_level,

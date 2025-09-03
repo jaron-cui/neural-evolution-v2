@@ -11,18 +11,17 @@ class NeuralSimulation:
     max_neuron_count = genome.chamber_count * genome.max_chamber_capacity
     neuron_data_size = d.size()
 
+    self.time = 0
     self.neurons = torch.zeros((max_neuron_count, neuron_data_size))
     self.living_neuron_mask = torch.zeros(max_neuron_count, dtype=torch.bool)
 
     # (chamber, src, dst)
     self.chamber_connection_strength = torch.zeros(
       (genome.chamber_count, genome.max_chamber_capacity, genome.max_chamber_capacity))
-    # (src_chamber, dst_chamber, connection)
-    self.inter_chamber_connection_strength = torch.zeros(
-      (genome.chamber_count, genome.chamber_count, genome.max_chamber_capacity))
-    # (src_chamber, dst_chamber, connection, src-dst)
-    self.inter_chamber_connections = torch.full(
-      (genome.chamber_count, genome.chamber_count, genome.max_chamber_capacity, 2), -1, dtype=torch.int16)
+    # (num_connections, src-dst)
+    self.inter_chamber_connections = torch.zeros((0, 2), dtype=torch.int)
+    # (num_connections, strength)
+    self.inter_chamber_connection_strengths = torch.zeros(0, dtype=torch.float)
 
     self.d = d
     self.genome = genome
@@ -88,15 +87,13 @@ class NeuralSimulation:
     # TODO: hormones for population
 
     # calculate systemic statistics TODO: perhaps move this after connection and other updates
-    inter_chamber_connection_mask = self.inter_chamber_connections[:, :, :, 0] >= 0
-    inter_chamber_connection_src = self.inter_chamber_connections[inter_chamber_connection_mask, 0].flatten()
-    inter_chamber_connection_dst = self.inter_chamber_connections[inter_chamber_connection_mask, 1].flatten()
-    inter_chamber_connection_strength = self.inter_chamber_connection_strength[inter_chamber_connection_mask].flatten()
 
+    inter_chamber_src = self.inter_chamber_connections[0]
+    inter_chamber_dst = self.inter_chamber_connections[1]
     total_output_connection_strength = self.chamber_connection_strength.sum(dim=2).flatten()
-    total_output_connection_strength.scatter_add_(0, inter_chamber_connection_src, inter_chamber_connection_strength)
+    total_output_connection_strength.scatter_add_(0, inter_chamber_src, self.inter_chamber_connection_strengths)
     total_input_connection_strength = self.chamber_connection_strength.sum(dim=1).flatten()
-    total_input_connection_strength.scatter_add_(0, inter_chamber_connection_dst, inter_chamber_connection_strength)
+    total_input_connection_strength.scatter_add_(0, inter_chamber_dst, self.inter_chamber_connection_strengths)
 
     new_neurons[:, d.indices(d.total_output_connection_strength)] = total_input_connection_strength
     new_neurons[:, d.indices(d.total_input_connection_strength)] = total_input_connection_strength
@@ -133,12 +130,12 @@ class NeuralSimulation:
       chamber_neuron_indices = torch.arange(
         self.neurons.size(0), dtype=torch.int)[chamber_start:chamber_end][chamber_living_mask]
 
-      src_in_chamber = (inter_chamber_connection_src >= chamber_start) & (inter_chamber_connection_src < chamber_end)
-      dst_in_chamber = (inter_chamber_connection_dst >= chamber_start) & (inter_chamber_connection_dst < chamber_end)
+      src_in_chamber = (inter_chamber_src >= chamber_start) & (inter_chamber_src < chamber_end)
+      dst_in_chamber = (inter_chamber_dst >= chamber_start) & (inter_chamber_dst < chamber_end)
       external_neuron_indices = torch.cat((
-        inter_chamber_connection_src[dst_in_chamber],
-        inter_chamber_connection_dst[src_in_chamber])
-      ).unique()
+        inter_chamber_src[dst_in_chamber],
+        inter_chamber_dst[src_in_chamber]
+      )).unique()
       # external_phenotypes = connection_phenotype[external_neurons]
       internal_pairs = torch.cartesian_prod(chamber_neuron_indices, chamber_neuron_indices)
       internal_to_external_pairs = torch.cartesian_prod(chamber_neuron_indices, external_neuron_indices)
@@ -159,24 +156,41 @@ class NeuralSimulation:
 
       # WARNING: THIS DIRECTLY MUTATES STATE. TODO: CHECK THAT THIS IS FINE
       self.chamber_connection_strength[chamber_number] += internal_changes
-      external_to_internal_mask = inter_chamber_connection_mask.clone()
-      external_to_internal_mask[external_to_internal_mask] = dst_in_chamber
-      self.inter_chamber_connection_strength[external_to_internal_mask] += external_to_internal_changes
-      internal_to_external_mask = inter_chamber_connection_mask.clone()
-      internal_to_external_mask[internal_to_external_mask] = src_in_chamber
-      self.inter_chamber_connection_strength[internal_to_external_mask] += internal_to_external_changes
+      self.inter_chamber_connection_strengths[dst_in_chamber] += external_to_internal_changes
+      self.inter_chamber_connection_strengths[src_in_chamber] += internal_to_external_changes
+
+    # internal chamber dst connection characteristics
+    dst_connection_characteristics = (
+      self.chamber_connection_strength.unsqueeze(-1) * torch.stack(
+        connection_phenotype.chunk(self.genome.chamber_count)
+      )
+    ).sum(dim=-2)
+    # add chamber external dst connection characteristics
+    dst_connection_characteristics.scatter_add_(
+      0, inter_chamber_src, self.inter_chamber_connection_strengths * connection_phenotype[inter_chamber_dst])
+    # internal chamber src connection characteristics
+    src_connection_characteristics = (
+      self.chamber_connection_strength.unsqueeze(-1) * torch.stack(
+        connection_phenotype.chunk(self.genome.chamber_count)
+      ).unsqueeze(1)
+    ).sum(dim=-2)
+    # add chamber external dst connection characteristics
+    src_connection_characteristics.scatter_add_(
+      0, inter_chamber_dst, self.inter_chamber_connection_strengths * connection_phenotype[inter_chamber_src])
+    new_neurons[:, d.indices(d.input_connection_character)] = src_connection_characteristics
+    new_neurons[:, d.indices(d.output_connection_character)] = dst_connection_characteristics
 
     # -- process signals per group --
     raw_output_signal_rate = self.neurons[:, d.indices(d.output_signal_rate)]
     raw_output_signal_rate[~self.living_neuron_mask] = 0
     # internal input signal rate
-    input_signal_rate = self.chamber_connection_strength * torch.stack(
+    input_signal_rate = (self.chamber_connection_strength * torch.stack(
       raw_output_signal_rate.chunk(self.genome.chamber_count)
-    ).unsqueeze(2).sum(dim=1).flatten()
+    ).unsqueeze(2)).sum(dim=1).flatten()
 
     # add inter-chamber signals
-    inter_chamber_signal_rate = inter_chamber_connection_strength * raw_output_signal_rate[inter_chamber_connection_src]
-    input_signal_rate.scatter_add_(0, inter_chamber_connection_dst, inter_chamber_signal_rate)
+    inter_chamber_signal_rate = self.inter_chamber_connection_strengths * raw_output_signal_rate[inter_chamber_src]
+    input_signal_rate.scatter_add_(0, inter_chamber_dst, inter_chamber_signal_rate)
 
     potassium = self.neurons[:, d.indices(d.internal_potassium_level)]
     potassium_recovery = self.neurons[:, d.indices(d.potassium_recovery_rate)]
@@ -186,7 +200,6 @@ class NeuralSimulation:
     ), potassium)  # TODO: sodium?
     new_neurons[:, d.indices(d.output_signal_rate)] = output_signal_rate
     new_neurons[:, d.indices(d.internal_potassium_level)] = potassium - output_signal_rate + potassium_recovery
-
 
     # handle apoptosis and mitosis
     apoptosis_initiated = self.neurons[:, d.indices(d.apoptosis_progress)] >= 1
@@ -217,21 +230,38 @@ class NeuralSimulation:
       parent_chamber_number[internal_mitosis],
       parent_chamber_index[internal_mitosis],
       child_chamber_index[internal_mitosis]
-    ] = parent_child_connection_strength
+    ] = parent_child_connection_strength[internal_mitosis]
     self.chamber_connection_strength[
       parent_chamber_number[internal_mitosis],
       child_chamber_index[internal_mitosis],
       parent_chamber_index[internal_mitosis]
-    ] = child_parent_connection_strength
+    ] = child_parent_connection_strength[internal_mitosis]
 
-    self.inter_chamber_connections[
-      parent_chamber_number[~internal_mitosis],
-      chamber_selection[~internal_mitosis],
+    self.inter_chamber_connections = torch.cat((
+      self.inter_chamber_connections,
+      torch.stack((parent_indices[~internal_mitosis], child_indices[~internal_mitosis])),
+      torch.stack((child_indices[~internal_mitosis], parent_indices[~internal_mitosis]))
+    ))
+    self.inter_chamber_connection_strengths = torch.cat((
+      self.inter_chamber_connection_strengths,
+      parent_child_connection_strength[~internal_mitosis],
+      child_parent_connection_strength[~internal_mitosis]
+    ))
 
-    ]
+    gestation_hormone = self.genome.gestation_hormone * max(1 - self.time / self.genome.gestation_duration, 0)
+    population_hormone = self.genome.population_hormone * self.living_neuron_mask.view(
+      self.genome.chamber_count, self.genome.max_chamber_capacity
+    ).sum(dim=1, keepdim=True) / self.genome.max_chamber_capacity
+    new_neurons[self.living_neuron_mask, d.indices(d.hormone_level)] = population_hormone + gestation_hormone
+
+    self.time += 1
+
+    self.neurons.copy_(new_neurons)
+
 
 def unique_prefix_length(tensor):
   return (torch.cumsum(torch.zeros_like(tensor).scatter_(0, tensor, 1), dim=0).eq(1)).sum()
+
 
 def first_n_unique_indices(tensor):
   return torch.unique(tensor, return_inverse=True)[1].sort()[1]

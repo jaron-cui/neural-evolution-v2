@@ -10,6 +10,9 @@ from neuron import NeuronDataFields, NeuronDataField
 @dataclass
 class Genome:
   initial_latent_states: Dict[str, torch.Tensor]  # each will have a neuron instantiated in its own chamber
+  gestation_duration: int
+  gestation_hormone: torch.Tensor
+  population_hormone: torch.Tensor
   step_network: 'StepNetwork'
   connection_phenotype_network: 'ConnectionPhenotypeNetwork'
   connection_change_network: 'ConnectionChangeNetwork'
